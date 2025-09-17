@@ -1,4 +1,6 @@
 import os
+import subprocess
+import time
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -96,12 +98,75 @@ tabs = st.tabs([
 
 with tabs[0]:
     st.subheader("Интерактивный граф процесса (DFG)")
+
+    with st.expander("Собрать/обновить граф", expanded=False):
+        colA, colB = st.columns(2)
+        with colA:
+            input_csv = st.text_input("Входной CSV", value=os.path.join(base_dir, "case_championship_last.csv"))
+            case_col = st.text_input("Колонка кейса", value="ID")
+            activity_col = st.text_input("Колонка активности", value="Событие")
+            ts_col = st.text_input("Колонка времени", value="Время")
+            ts_format = st.text_input("Формат времени (опционально)", value="")
+            rankdir = st.selectbox("Направление", options=["TB","LR","BT","RL"], index=0)
+            sep = st.text_input("Разделитель CSV", value=",")
+            encoding = st.text_input("Кодировка", value="utf-8")
+        with colB:
+            min_freq = st.number_input("Мин. частота ребра", min_value=0, max_value=1000, value=1, step=1)
+            rare_edge_threshold = st.number_input("Порог редких рёбер", min_value=0, max_value=1000, value=3, step=1)
+            bottleneck_p90_threshold_s = st.number_input("Порог p90 (сек) для bottleneck", min_value=0, max_value=864000, value=43200, step=3600)
+            sla_csv = st.text_input("SLA CSV", value=os.path.join(tables_dir, "edges_sla_template.csv"))
+            top_variant_csv = st.text_input("Top variants CSV", value=os.path.join(tables_dir, "variants_top.csv"))
+            rare_activity_threshold = st.number_input("Порог редких активностей (доля)", min_value=0.0, max_value=1.0, value=0.02, step=0.01)
+        out_png = os.path.join(base_dir, "dfg_combined.png")
+
+        if st.button("Собрать граф", type="primary"):
+            cmd = [
+                "/opt/anaconda3/bin/python",
+                os.path.join(base_dir, "process_report.py"),
+                "-i", input_csv,
+                "-o", out_png,
+                "--case-col", case_col,
+                "--activity-col", activity_col,
+                "--timestamp-col", ts_col,
+                "--rankdir", rankdir,
+                "--min-freq", str(min_freq),
+                "--sep", sep,
+                "--encoding", encoding,
+                "--sla-csv", sla_csv,
+                "--top-variant-csv", top_variant_csv,
+                "--rare-edge-threshold", str(rare_edge_threshold),
+                "--bottleneck-p90-threshold-s", str(int(bottleneck_p90_threshold_s)),
+                "--tables-dir", tables_dir,
+                "--rare-activity-threshold", str(rare_activity_threshold),
+            ]
+            if ts_format.strip():
+                cmd.extend(["--timestamp-format", ts_format.strip()])
+            try:
+                with st.spinner("Генерация графа..."):
+                    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    st.success("Граф сгенерирован")
+                    st.code(proc.stdout or "", language="bash")
+                    # После генерации обновим HTML
+                    html_target = os.path.join(base_dir, "dfg_combined.html")
+                    if os.path.isfile(html_target):
+                        load_text.clear()  # очистить кэш
+                        # небольшая пауза для файловой системы
+                        time.sleep(0.2)
+                        html_content = load_text(html_target)
+                        st.components.v1.html(html_content, height=800, scrolling=True)
+                        html_path = html_target
+                    else:
+                        st.warning("HTML граф не найден. Проверьте логи генерации.")
+            except subprocess.CalledProcessError as e:
+                st.error("Ошибка генерации графа")
+                st.code((e.stdout or "") + "\n" + (e.stderr or ""))
+
     if os.path.isfile(html_path):
         html = load_text(html_path)
         st.components.v1.html(html, height=800, scrolling=True)
-        st.info("Если граф не обновился — пересоберите его командой process_report.py и перезагрузите страницу.")
+        st.info("Для обновления параметров используйте блок 'Собрать/обновить граф'.")
     else:
-        st.warning("Файл dfg_combined.html не найден. Запустите скрипт генерации или укажите путь в сайдбаре.")
+        st.warning("Файл dfg_combined.html не найден. Запустите сборку графа выше или укажите путь в сайдбаре.")
 
 with tabs[1]:
     st.subheader("KPI по стадиям")
