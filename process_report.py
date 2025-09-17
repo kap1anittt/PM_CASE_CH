@@ -17,6 +17,7 @@ import pandas as pd
 import pm4py
 from pm4py.algo.discovery.dfg import algorithm as dfg_algo
 from graphviz import Digraph
+import matplotlib.pyplot as plt
 
 # -------------------------------
 # Вспомогательные функции
@@ -563,6 +564,153 @@ def _export_duration_trend_test(df: pd.DataFrame, out_txt: str):
         f.write("increasing\n" if tau > 0 and p < 0.05 else ("decreasing\n" if tau < 0 and p < 0.05 else "no_trend\n"))
 
 
+def _export_off_golden_edges(freq_dfg: Dict[Tuple[str, str], int], golden_edges: set, out_csv: str):
+    if not freq_dfg:
+        return
+    rows = []
+    for (a, b), f in freq_dfg.items():
+        if golden_edges and (a, b) not in golden_edges:
+            rows.append({"src": a, "dst": b, "count": f})
+    if rows:
+        pd.DataFrame(rows).sort_values("count", ascending=False).to_csv(out_csv, index=False)
+
+
+def _export_worker_stats(transitions_df: pd.DataFrame, out_load_csv: str, out_time_csv: str):
+    if transitions_df is None or transitions_df.empty:
+        return
+    # Нагрузка по исполнителям
+    load = transitions_df.groupby("worker_to").size().reset_index(name="events").rename(columns={"worker_to": "worker"})
+    load.sort_values("events", ascending=False).to_csv(out_load_csv, index=False)
+    # Среднее время перехода по исполнителю (куда пришло)
+    tt = transitions_df.dropna(subset=["delta_s"]).groupby("worker_to")["delta_s"].agg(["count", "mean", "median"]).reset_index().rename(columns={"worker_to": "worker", "mean": "mean_s", "median": "median_s"})
+    tt.sort_values("mean_s", ascending=False).to_csv(out_time_csv, index=False)
+
+
+def _export_funnel(formatted_df: pd.DataFrame, top_variant_csv: Optional[str], out_csv: str):
+    steps = []
+    if top_variant_csv and os.path.isfile(top_variant_csv):
+        try:
+            vt = pd.read_csv(top_variant_csv)
+            vt = vt.sort_values("count", ascending=False)
+            if len(vt) > 0:
+                seq_str = vt.iloc[0]["variant"]
+                steps = [s.strip() for s in str(seq_str).replace("(", "").replace(")", "").replace("'", "").split("→") if s.strip()]
+        except Exception:
+            steps = []
+    if not steps:
+        return
+    # присутствие шагов в кейсах
+    cases = formatted_df["case:concept:name"].unique().tolist()  # type: ignore
+    present = {s: set() for s in steps}
+    for cid, g in formatted_df.groupby("case:concept:name"):  # type: ignore
+        acts = set(g["concept:name"].tolist())  # type: ignore
+        for s in steps:
+            if s in acts:
+                present[s].add(cid)
+    rows = []
+    start_n = len(present[steps[0]])
+    for s in steps:
+        n = len(present[s])
+        conv = (n / start_n) if start_n else 0.0
+        rows.append({"step": s, "cases": n, "conversion": conv})
+    if rows:
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+
+def _generate_category_figs(tables_dir: str, figs_dir: str):
+    os.makedirs(figs_dir, exist_ok=True)
+    def save_bar(df: pd.DataFrame, x: str, y: str, title: str, fname: str, top: int = 20, horizontal: bool = True, color: str = "#4f46e5"):
+        if df is None or df.empty:
+            return
+        d = df.head(top)
+        plt.figure(figsize=(10, 6))
+        if horizontal:
+            plt.barh(d[y], d[x], color=color)
+            plt.gca().invert_yaxis()
+            plt.xlabel(x)
+            plt.ylabel(y)
+        else:
+            plt.bar(d[x], d[y], color=color)
+            plt.ylabel(y)
+            plt.xticks(rotation=45, ha='right')
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(os.path.join(figs_dir, fname))
+        plt.close()
+
+    def save_line(df: pd.DataFrame, x: str, y: str, title: str, fname: str, color: str = "#22c55e"):
+        if df is None or df.empty:
+            return
+        plt.figure(figsize=(10, 5))
+        plt.plot(df[x], df[y], marker='o', color=color)
+        plt.title(title)
+        plt.xlabel(x)
+        plt.ylabel(y)
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(figs_dir, fname))
+        plt.close()
+
+    # Загрузка таблиц
+    def load_csv(name):
+        p = os.path.join(tables_dir, name)
+        return pd.read_csv(p) if os.path.isfile(p) else None
+
+    loops = load_csv("repeated_same_activity.csv")
+    rare = load_csv("rare_activities.csv")
+    bott = load_csv("bottlenecks_edges.csv")
+    stage = load_csv("stage_kpi.csv")
+    trend = load_csv("duration_trend_by_month.csv")
+    if trend is None:
+        trend = load_csv("cohort_trends.csv")
+    returns = load_csv("returns.csv")
+    rstart = load_csv("return_to_start.csv")
+    offgold = load_csv("off_golden_edges.csv")
+    hand = load_csv("handoff_matrix.csv")
+    worker_load = load_csv("worker_load.csv")
+    worker_time = load_csv("worker_transition_time.csv")
+    funnel = load_csv("funnel.csv")
+    manual = load_csv("manual_steps.csv")
+
+    # Частотные
+    if loops is not None:
+        save_bar(loops.sort_values("count", ascending=False), x="count", y="src", title="Петли A→A (топ)", fname="loops_top.png")
+    if rare is not None:
+        save_bar(rare.sort_values("share"), x="share", y="activity", title="Редкие этапы (<2%)", fname="rare_steps.png")
+    if funnel is not None:
+        save_line(funnel, x="step", y="conversion", title="Воронка по топ-варианту (конверсия)", fname="funnel_conversion.png")
+
+    # Временные
+    if bott is not None:
+        save_bar(bott.sort_values("p90_s", ascending=False), x="p90_s", y="src", title="Bottlenecks p90 (топ)", fname="bottlenecks_p90.png")
+    if stage is not None:
+        save_bar(stage.sort_values("p90_s", ascending=False), x="p90_s", y="stage", title="Ступени с максимальным p90", fname="stages_p90.png")
+    if trend is not None and "month" in trend.columns and ("median" in trend.columns or "median_s" in trend.columns):
+        ycol = "median" if "median" in trend.columns else "median_s"
+        save_line(trend.sort_values("month"), x="month", y=ycol, title="Медиана длительности по месяцам", fname="trend_median_month.png")
+
+    # Последовательность
+    if returns is not None:
+        save_bar(returns.sort_values("count", ascending=False), x="count", y="dst", title="Возвраты к пройденным шагам", fname="returns.png")
+    if rstart is not None:
+        save_bar(rstart.sort_values("count", ascending=False), x="count", y="dst", title="Возвраты к старту", fname="return_to_start.png")
+    if offgold is not None:
+        save_bar(offgold.sort_values("count", ascending=False), x="count", y="dst", title="Переходы вне эталонного пути", fname="off_golden.png")
+
+    # Сотрудники
+    if hand is not None:
+        save_bar(hand.sort_values("count", ascending=False), x="count", y="to", title="Передачи между исполнителями (топ)", fname="handoff_top.png")
+    if worker_load is not None:
+        save_bar(worker_load.sort_values("events", ascending=False), x="events", y="worker", title="Нагрузка по исполнителям (события)", fname="worker_load.png")
+    if worker_time is not None:
+        save_bar(worker_time.sort_values("mean_s", ascending=False), x="mean_s", y="worker", title="Среднее время перехода по исполнителю", fname="worker_time.png")
+
+    # Ручные/авто операции
+    if manual is not None:
+        save_bar(manual.sort_values("manual_channel_events", ascending=False), x="manual_channel_events", y="activity", title="Ручные каналы по активностям", fname="manual_channels.png")
+        save_bar(manual.sort_values("worker_missing_events", ascending=False), x="worker_missing_events", y="activity", title="Отсутствие исполнителя по активностям", fname="worker_missing.png")
+
+
 def build_and_save_dfg(
     input_csv: str,
     output_png: str,
@@ -582,7 +730,9 @@ def build_and_save_dfg(
     export_svg: bool = True,
     export_html: bool = True,
     tables_dir: str = "tables",
-    rare_activity_threshold: float = 0.02
+    rare_activity_threshold: float = 0.02,
+    export_figs: bool = True,
+    figs_dir: str = "figs"
 ) -> None:
     if not os.path.isfile(input_csv):
         raise FileNotFoundError(f"Не найден входной CSV: {input_csv}")
@@ -724,6 +874,17 @@ def build_and_save_dfg(
         # Cohort trends and trend test
         _export_cohort_trends(formatted_df, os.path.join(tables_dir, "cohort_trends.csv"))
         _export_duration_trend_test(formatted_df, os.path.join(tables_dir, "duration_trend_test.txt"))
+        # Off-golden edges
+        _export_off_golden_edges(freq_dfg, golden_edges, os.path.join(tables_dir, "off_golden_edges.csv"))
+        # Worker stats
+        _export_worker_stats(trans_df, os.path.join(tables_dir, "worker_load.csv"), os.path.join(tables_dir, "worker_transition_time.csv"))
+        # Funnel
+        _export_funnel(formatted_df, top_variant_csv, os.path.join(tables_dir, "funnel.csv"))
+
+    # Генерация PNG-графиков категорий
+    if export_figs:
+        os.makedirs(figs_dir, exist_ok=True)
+        _generate_category_figs(tables_dir, figs_dir)
 
 
 # -------------------------------
@@ -753,6 +914,8 @@ def parse_args(argv=None):
     parser.add_argument("--no-html", action="store_true", help="Не сохранять HTML")
     parser.add_argument("--tables-dir", default="tables", help="Папка для CSV отчётов")
     parser.add_argument("--rare-activity-threshold", type=float, default=0.02, help="Порог доли кейсов для редких активностей")
+    parser.add_argument("--no-figs", action="store_true", help="Не генерировать PNG-графики категорий")
+    parser.add_argument("--figs-dir", default="figs", help="Папка для PNG-графиков категорий")
     return parser.parse_args(argv)
 
 
@@ -778,6 +941,8 @@ def main(argv=None):
         export_html=not args.no_html,
         tables_dir=args.tables_dir,
         rare_activity_threshold=args.rare_activity_threshold,
+        export_figs=not args.no_figs,
+        figs_dir=args.figs_dir,
     )
     print(f"Готово. PNG: {os.path.abspath(args.output)}")
 

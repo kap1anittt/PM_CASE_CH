@@ -144,3 +144,43 @@
 - KPI по стадиям, Handoff/«пинг‑понг», SLA‑нарушения
 - Возвраты/редкие/ручные шаги, аномалии, варианты, коорт‑тренды
 - Вкладку «DFG» с интерактивным графом процесса (`dfg_combined.html`)
+
+## 🧭 Категории узких мест и визуализации
+
+Ниже — типы неэффективностей, обнаруживаемые в датасете, и соответствующие артефакты.
+
+- Частотные:
+  - Петли A→A — `tables/repeated_same_activity.csv`, график: `figs/loops_top.png`
+  - Редкие этапы — `tables/rare_activities.csv`, график: `figs/rare_steps.png`
+  - Воронка по топ‑варианту — `tables/funnel.csv`, график: `figs/funnel_conversion.png`
+- Временные:
+  - Узкие места по p90 — `tables/bottlenecks_edges.csv`, график: `figs/bottlenecks_p90.png`
+  - Ступени с высоким p90 — `tables/stage_kpi.csv`, график: `figs/stages_p90.png`
+  - Тренд медианы — `tables/duration_trend_by_month.csv` или `tables/cohort_trends.csv`, график: `figs/trend_median_month.png`
+- С последовательностью:
+  - Возвраты к пройденным шагам — `tables/returns.csv`, график: `figs/returns.png`
+  - Возврат к старту — `tables/return_to_start.csv`, график: `figs/return_to_start.png`
+  - Вне эталонного пути — `tables/off_golden_edges.csv`, график: `figs/off_golden.png`
+- Сотрудники:
+  - Передачи между исполнителями — `tables/handoff_matrix.csv`, график: `figs/handoff_top.png`
+  - Нагрузка по событиям — `tables/worker_load.csv`, график: `figs/worker_load.png`
+  - Среднее время перехода — `tables/worker_transition_time.csv`, график: `figs/worker_time.png`
+- Ручные/авто операции:
+  - Ручные каналы — `tables/manual_steps.csv`, график: `figs/manual_channels.png`
+  - Отсутствие исполнителя — `tables/manual_steps.csv`, график: `figs/worker_missing.png`
+
+Перегенерация данных и графиков:
+
+```bash
+/opt/anaconda3/bin/python /Users/anna/Documents/r2/PM_CASE_CH/process_report.py \
+  -i /Users/anna/Documents/r2/PM_CASE_CH/case_championship_last.csv \
+  -o /Users/anna/Documents/r2/PM_CASE_CH/dfg_combined.png \
+  --case-col ID --activity-col Событие --timestamp-col Время \
+  --rankdir TB --min-freq 1 \
+  --sla-csv /Users/anna/Documents/r2/PM_CASE_CH/tables/edges_sla_template.csv \
+  --top-variant-csv /Users/anna/Documents/r2/PM_CASE_CH/tables/variants_top.csv \
+  --tables-dir /Users/anna/Documents/r2/PM_CASE_CH/tables \
+  --figs-dir /Users/anna/Documents/r2/PM_CASE_CH/figs
+```
+
+Готовые картинки лежат в `figs/`. Их можно вставлять в презентации/отчёты.
