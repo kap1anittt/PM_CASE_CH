@@ -1,0 +1,2 @@
+Kendall tau: 0.1781, p-value: 0.242778
+no_trend

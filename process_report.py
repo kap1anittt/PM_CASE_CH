@@ -10,6 +10,8 @@ from collections import Counter, defaultdict
 import glob
 import difflib
 from statistics import median
+from scipy.stats import kendalltau
+import numpy as np
 
 import pandas as pd
 import pm4py
@@ -207,6 +209,360 @@ def _compute_edge_percentiles(df: pd.DataFrame) -> Dict[Tuple[str, str], Dict[st
     return result
 
 
+def _compute_transitions_and_cases(df: pd.DataFrame):
+    """Возвращает список переходов и длительности кейсов.
+    Переходы: case_id, src, dst, t_start, t_end, delta_s, channel_from, channel_to, worker_from, worker_to.
+    """
+    df = df.sort_values(["case:concept:name", "time:timestamp"])  # type: ignore
+    transitions = []
+    case_durations = {}
+    for case_id, g in df.groupby("case:concept:name"):  # type: ignore
+        g = g.copy()
+        acts = g["concept:name"].tolist()  # type: ignore
+        times = g["time:timestamp"].tolist()  # type: ignore
+        channels = g[g.columns[g.columns.str.lower().str.contains("канал")].tolist()[0]] if any(g.columns.str.lower().str.contains("канал")) else [None]*len(g)
+        workers = g[g.columns[g.columns.str.lower().str.contains("имя работника")].tolist()[0]] if any(g.columns.str.lower().str.contains("имя работника")) else [None]*len(g)
+        # Длительность кейса
+        if len(times) >= 2 and pd.notnull(times[0]) and pd.notnull(times[-1]):
+            case_durations[case_id] = (times[-1] - times[0]).total_seconds()
+        # Переходы
+        ch = channels if hasattr(channels, "tolist") else channels
+        wk = workers if hasattr(workers, "tolist") else workers
+        ch_list = ch.tolist() if hasattr(ch, "tolist") else list(ch)
+        wk_list = wk.tolist() if hasattr(wk, "tolist") else list(wk)
+        for i in range(1, len(acts)):
+            t1, t2 = times[i-1], times[i]
+            if pd.notnull(t1) and pd.notnull(t2):
+                dt = (t2 - t1).total_seconds()
+            else:
+                dt = None
+            transitions.append({
+                "case_id": case_id,
+                "src": acts[i-1],
+                "dst": acts[i],
+                "t_start": t1,
+                "t_end": t2,
+                "delta_s": dt,
+                "channel_from": ch_list[i-1] if i-1 < len(ch_list) else None,
+                "channel_to": ch_list[i] if i < len(ch_list) else None,
+                "worker_from": wk_list[i-1] if i-1 < len(wk_list) else None,
+                "worker_to": wk_list[i] if i < len(wk_list) else None,
+            })
+    return transitions, case_durations
+
+
+def _export_sla_breaches(transitions_df: pd.DataFrame, sla_map: Dict[Tuple[str, str], float], out_csv: str):
+    rows = []
+    for _, r in transitions_df.iterrows():
+        pair = (str(r["src"]), str(r["dst"]))
+        if r["delta_s"] is None:
+            continue
+        thr = sla_map.get(pair)
+        if thr is not None and float(r["delta_s"]) > float(thr):
+            rows.append({
+                "case_id": r["case_id"], "src": r["src"], "dst": r["dst"],
+                "delta_s": float(r["delta_s"]), "sla_s": float(thr),
+                "t_start": r["t_start"], "t_end": r["t_end"],
+                "channel_from": r.get("channel_from"), "channel_to": r.get("channel_to"),
+                "worker_from": r.get("worker_from"), "worker_to": r.get("worker_to"),
+            })
+    if rows:
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+
+def _export_handoff_and_pingpong(transitions_df: pd.DataFrame, out_matrix_csv: str, out_pingpong_csv: str):
+    # Матрица передач по сотрудникам
+    def normalize(v):
+        return str(v) if pd.notnull(v) else "UNKNOWN"
+    hand = Counter()
+    for _, r in transitions_df.iterrows():
+        a = normalize(r.get("worker_from"))
+        b = normalize(r.get("worker_to"))
+        hand[(a, b)] += 1
+    if hand:
+        pd.DataFrame([{"from": k[0], "to": k[1], "count": v} for k, v in hand.items()]).to_csv(out_matrix_csv, index=False)
+    # Пинг‑понг: A->B затем B->A в рамках кейса
+    ping = Counter()
+    for case_id, grp in transitions_df.groupby("case_id"):
+        grp = grp.sort_values("t_start")
+        pairs = list(zip(grp["worker_from"].astype(str), grp["worker_to"].astype(str)))
+        for i in range(1, len(pairs)):
+            if pairs[i-1][0] == pairs[i][1] and pairs[i-1][1] == pairs[i][0] and pairs[i][0] != pairs[i][1]:
+                ping[(pairs[i][0], pairs[i][1])] += 1
+    if ping:
+        pd.DataFrame([{"a": k[0], "b": k[1], "ping_pongs": v} for k, v in ping.items()]).to_csv(out_pingpong_csv, index=False)
+
+
+def _export_stage_kpi(transitions_df: pd.DataFrame, out_csv: str):
+    by_stage: Dict[str, list] = defaultdict(list)
+    total = 0.0
+    for _, r in transitions_df.iterrows():
+        dt = r.get("delta_s")
+        if dt is None:
+            continue
+        by_stage[str(r["src"])].append(float(dt))
+        total += float(dt)
+    rows = []
+    for stage, arr in by_stage.items():
+        arr_sorted = sorted(arr)
+        n = len(arr_sorted)
+        p50 = median(arr_sorted)
+        p90 = arr_sorted[max(0, int(math.ceil(0.9 * n)) - 1)]
+        share = (sum(arr_sorted) / total) if total > 0 else 0.0
+        rows.append({"stage": stage, "count": n, "p50_s": p50, "p90_s": p90, "time_share": share})
+    if rows:
+        pd.DataFrame(rows).sort_values("p90_s", ascending=False).to_csv(out_csv, index=False)
+
+
+def _export_variant_explorer(df: pd.DataFrame, out_csv: str):
+    df = df.sort_values(["case:concept:name", "time:timestamp"])  # type: ignore
+    rows = []
+    cur_case = None
+    seq = []
+    t_first = None
+    t_last = None
+    channel_col = next((c for c in df.columns if c.lower() == "канал"), None)
+    type_col = next((c for c in df.columns if c.lower().startswith("тип страхового случая")), None)
+    case_to_channel = {}
+    case_to_type = {}
+    for _, r in df.iterrows():
+        cid = r["case:concept:name"]
+        if cur_case is None:
+            cur_case = cid
+            t_first = r["time:timestamp"]
+        if cid != cur_case:
+            if seq and pd.notnull(t_first) and pd.notnull(t_last):
+                rows.append({
+                    "case_id": cur_case,
+                    "variant": "→".join(map(str, seq)),
+                    "duration_s": (t_last - t_first).total_seconds(),
+                    "channel": case_to_channel.get(cur_case),
+                    "case_type": case_to_type.get(cur_case)
+                })
+            cur_case = cid
+            seq = []
+            t_first = r["time:timestamp"]
+        seq.append(r["concept:name"])  # type: ignore
+        t_last = r["time:timestamp"]
+        if channel_col is not None and cid not in case_to_channel:
+            case_to_channel[cid] = r[channel_col]
+        if type_col is not None and cid not in case_to_type:
+            case_to_type[cid] = r[type_col]
+    # last
+    if seq and pd.notnull(t_first) and pd.notnull(t_last):
+        rows.append({
+            "case_id": cur_case,
+            "variant": "→".join(map(str, seq)),
+            "duration_s": (t_last - t_first).total_seconds(),
+            "channel": case_to_channel.get(cur_case),
+            "case_type": case_to_type.get(cur_case)
+        })
+    if not rows:
+        return
+    dfv = pd.DataFrame(rows)
+    agg = dfv.groupby("variant").agg(
+        count=("case_id", "nunique"),
+        median_s=("duration_s", "median"),
+        mean_s=("duration_s", "mean")
+    ).reset_index()
+    # топ признаки
+    top_chan = dfv.groupby(["variant", "channel"])['case_id'].nunique().reset_index().sort_values(['variant','case_id'], ascending=[True,False]).groupby('variant').first().reset_index().rename(columns={'channel':'top_channel','case_id':'cases_channel'})
+    top_type = dfv.groupby(["variant", "case_type"])['case_id'].nunique().reset_index().sort_values(['variant','case_id'], ascending=[True,False]).groupby('variant').first().reset_index().rename(columns={'case_type':'top_case_type','case_id':'cases_type'})
+    out = agg.merge(top_chan, on='variant', how='left').merge(top_type, on='variant', how='left')
+    out.sort_values(['count','median_s'], ascending=[False, True]).to_csv(out_csv, index=False)
+
+
+def _export_anomalies(df: pd.DataFrame, transitions_df: pd.DataFrame, out_csv: str):
+    # Дуринг p99
+    case_durations = []
+    for cid, g in df.groupby("case:concept:name"):
+        g = g.sort_values("time:timestamp")
+        if len(g) >= 2:
+            t = (g.iloc[-1]["time:timestamp"] - g.iloc[0]["time:timestamp"]).total_seconds()
+            case_durations.append((cid, t, len(g)))
+    if not case_durations:
+        return
+    import numpy as np
+    arr = np.array([t for _, t, _ in case_durations], dtype=float)
+    thr = float(np.percentile(arr, 99))
+    # метрики по лупам и пинг‑понгу
+    loops_by_case = Counter()
+    ping_by_case = Counter()
+    for cid, g in transitions_df.groupby("case_id"):
+        g = g.sort_values("t_start")
+        # loops A->A
+        loops_by_case[cid] = int((g["src"] == g["dst"]).sum())
+        # ping‑pong
+        pairs = list(zip(g["worker_from"].astype(str), g["worker_to"].astype(str)))
+        pp = 0
+        for i in range(1, len(pairs)):
+            if pairs[i-1][0] == pairs[i][1] and pairs[i-1][1] == pairs[i][0] and pairs[i][0] != pairs[i][1]:
+                pp += 1
+        ping_by_case[cid] = pp
+    rows = []
+    for cid, dur, n in case_durations:
+        if dur >= thr:
+            rows.append({"case_id": cid, "duration_s": dur, "events": n, "loops": int(loops_by_case.get(cid, 0)), "ping_pong": int(ping_by_case.get(cid, 0))})
+    if rows:
+        pd.DataFrame(rows).sort_values("duration_s", ascending=False).to_csv(out_csv, index=False)
+
+
+def _export_returns_and_starts(df: pd.DataFrame, out_returns: str, out_return_start: str):
+    df = df.sort_values(["case:concept:name", "time:timestamp"])  # type: ignore
+    returns = Counter()
+    ret_to_start = Counter()
+    for cid, g in df.groupby("case:concept:name"):  # type: ignore
+        acts = g["concept:name"].tolist()  # type: ignore
+        if not acts:
+            continue
+        start = acts[0]
+        seen = set([start])
+        prev = start
+        for i in range(1, len(acts)):
+            cur = acts[i]
+            if cur == start and cur != prev:
+                ret_to_start[(prev, cur)] += 1
+            if cur in seen and cur != prev:
+                returns[(prev, cur)] += 1
+            seen.add(cur)
+            prev = cur
+    if returns:
+        pd.DataFrame([{"src": a, "dst": b, "count": c} for (a, b), c in sorted(returns.items(), key=lambda kv: -kv[1])]).to_csv(out_returns, index=False)
+    if ret_to_start:
+        pd.DataFrame([{"src": a, "dst": b, "count": c} for (a, b), c in sorted(ret_to_start.items(), key=lambda kv: -kv[1])]).to_csv(out_return_start, index=False)
+
+
+def _export_activity_ping_pong(df: pd.DataFrame, out_csv: str):
+    df = df.sort_values(["case:concept:name", "time:timestamp"])  # type: ignore
+    ping = Counter()
+    for cid, g in df.groupby("case:concept:name"):  # type: ignore
+        acts = g["concept:name"].tolist()  # type: ignore
+        for i in range(2, len(acts)):
+            if acts[i] == acts[i-2] and acts[i] != acts[i-1]:
+                a, b = acts[i-2], acts[i-1]
+                if a != b:
+                    ping[(a, b)] += 1
+    if ping:
+        pd.DataFrame([{"a": a, "b": b, "count": c} for (a, b), c in sorted(ping.items(), key=lambda kv: -kv[1])]).to_csv(out_csv, index=False)
+
+
+def _export_rare_activities(df: pd.DataFrame, out_csv: str, rare_threshold: float = 0.02):
+    total_cases = df["case:concept:name"].nunique()  # type: ignore
+    per_act = df.groupby("concept:name")["case:concept:name"].nunique().reset_index().rename(columns={"concept:name": "activity", "case:concept:name": "cases"})  # type: ignore
+    per_act["share"] = per_act["cases"] / float(total_cases) if total_cases else 0.0
+    rare = per_act.sort_values("share").query("share < @rare_threshold")
+    if not rare.empty:
+        rare.to_csv(out_csv, index=False)
+
+
+def _export_manual_steps(df: pd.DataFrame, out_csv: str):
+    # Ищем признаки ручных шагов: наличие исполнителя и тип канала
+    channel_col = next((c for c in df.columns if c.lower() == "канал"), None)
+    worker_col = next((c for c in df.columns if c.lower() == "имя работника"), None)
+    df2 = df.copy()
+    if worker_col is not None:
+        df2["worker_missing"] = df2[worker_col].isna() | (df2[worker_col].astype(str).str.strip() == "")
+    else:
+        df2["worker_missing"] = True
+    manual_channels = {"Звонок", "Телефон", "Чат", "Email", "Почта", "Личное посещение"}
+    if channel_col is not None:
+        df2["manual_channel"] = df2[channel_col].astype(str).isin(manual_channels)
+    else:
+        df2["manual_channel"] = False
+    agg = df2.groupby("concept:name").agg(
+        events=("concept:name", "count"),
+        worker_missing_events=("worker_missing", "sum"),
+        manual_channel_events=("manual_channel", "sum")
+    ).reset_index().rename(columns={"concept:name": "activity"})
+    agg.to_csv(out_csv, index=False)
+
+
+def _export_unsuccess_outcomes(df: pd.DataFrame, out_csv: str):
+    df = df.sort_values(["case:concept:name", "time:timestamp"])  # type: ignore
+    rows = []
+    last_by_case = df.groupby("case:concept:name").tail(1)  # type: ignore
+    # Опознаём «Отклонение претензии» как неуспешный исход
+    last_by_case = last_by_case.copy()
+    last_by_case["unsuccess"] = last_by_case["concept:name"].astype(str).str.contains("Отклонение претензии", na=False)  # type: ignore
+    # Длительности кейсов
+    durations = {}
+    for cid, g in df.groupby("case:concept:name"):  # type: ignore
+        if len(g) >= 2:
+            durations[cid] = (g.iloc[-1]["time:timestamp"] - g.iloc[0]["time:timestamp"]).total_seconds()
+    chan_col = next((c for c in df.columns if c.lower() == "канал"), None)
+    type_col = next((c for c in df.columns if c.lower().startswith("тип страхового случая")), None)
+    for _, r in last_by_case.iterrows():
+        cid = r["case:concept:name"]
+        rows.append({
+            "case_id": cid,
+            "unsuccess": bool(r["unsuccess"]),
+            "duration_s": durations.get(cid),
+            "channel": r.get(chan_col) if chan_col else None,
+            "case_type": r.get(type_col) if type_col else None,
+            "last_activity": r["concept:name"],
+        })
+    if rows:
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+
+def _export_cohort_trends(df: pd.DataFrame, out_csv: str):
+    df = df.copy()
+    df["month"] = pd.to_datetime(df["time:timestamp"]).dt.to_period("M").dt.to_timestamp()  # type: ignore
+    chan_col = next((c for c in df.columns if c.lower() == "канал"), None)
+    type_col = next((c for c in df.columns if c.lower().startswith("тип страхового случая")), None)
+    # длительность кейса по month и сегментам: считаем по последнему событию кейса в месяце закрытия
+    rows = []
+    for (cid, m), g in df.groupby(["case:concept:name", "month"]):  # type: ignore
+        g = g.sort_values("time:timestamp")
+        if len(g) >= 2:
+            dur = (g.iloc[-1]["time:timestamp"] - g.iloc[0]["time:timestamp"]).total_seconds()
+            rows.append({
+                "case_id": cid,
+                "month": g.iloc[-1]["month"],
+                "duration_s": dur,
+                "channel": g.iloc[-1][chan_col] if chan_col else None,
+                "case_type": g.iloc[-1][type_col] if type_col else None,
+            })
+    if not rows:
+        return
+    cdf = pd.DataFrame(rows)
+    out_rows = []
+    for seg_col in [None, "channel", "case_type"]:
+        grp_cols = ["month"] + ([seg_col] if seg_col else [])
+        tmp = cdf.groupby(grp_cols)["duration_s"].agg(["count", "median", lambda x: np.percentile(x, 90)]).reset_index()
+        tmp = tmp.rename(columns={"median": "median_s", "<lambda_0>": "p90_s"})
+        tmp["segment"] = seg_col or "all"
+        out_rows.append(tmp)
+    out_df = pd.concat(out_rows, ignore_index=True)
+    out_df.to_csv(out_csv, index=False)
+
+
+def _export_duration_trend_test(df: pd.DataFrame, out_txt: str):
+    # Тест на монотонный тренд медианы по месяцам (Кендалл)
+    df = df.copy()
+    df["month"] = pd.to_datetime(df["time:timestamp"]).dt.to_period("M").dt.to_timestamp()  # type: ignore
+    # строим медиану длительности кейсов по месяцам
+    rows = []
+    for cid, g in df.groupby("case:concept:name"):  # type: ignore
+        g = g.sort_values("time:timestamp")
+        if len(g) >= 2:
+            rows.append({
+                "case_id": cid,
+                "month": g.iloc[-1]["month"],
+                "duration_s": (g.iloc[-1]["time:timestamp"] - g.iloc[0]["time:timestamp"]).total_seconds()
+            })
+    if not rows:
+        return
+    cdf = pd.DataFrame(rows)
+    series = cdf.groupby("month")["duration_s"].median().reset_index().sort_values("month")
+    x = np.arange(len(series))
+    y = series["duration_s"].values
+    tau, p = kendalltau(x, y)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write(f"Kendall tau: {tau:.4f}, p-value: {p:.6f}\n")
+        f.write("increasing\n" if tau > 0 and p < 0.05 else ("decreasing\n" if tau < 0 and p < 0.05 else "no_trend\n"))
+
+
 def build_and_save_dfg(
     input_csv: str,
     output_png: str,
@@ -221,7 +577,12 @@ def build_and_save_dfg(
     sla_csv: Optional[str] = None,
     top_variant_csv: Optional[str] = None,
     rare_edge_threshold: int = 5,
-    bottleneck_p90_threshold_s: Optional[float] = None
+    bottleneck_p90_threshold_s: Optional[float] = None,
+    export_reports: bool = True,
+    export_svg: bool = True,
+    export_html: bool = True,
+    tables_dir: str = "tables",
+    rare_activity_threshold: float = 0.02
 ) -> None:
     if not os.path.isfile(input_csv):
         raise FileNotFoundError(f"Не найден входной CSV: {input_csv}")
@@ -247,7 +608,7 @@ def build_and_save_dfg(
         except Exception:
             pass
 
-    # Эталонные рёбра из топ-варианта: распарсим первую строку с наибольшим count
+    # Эталонные рёбра из топ-варианта
     golden_edges: set = set()
     if top_variant_csv and os.path.isfile(top_variant_csv):
         try:
@@ -255,19 +616,9 @@ def build_and_save_dfg(
             vt = vt.sort_values("count", ascending=False)
             if len(vt) > 0:
                 seq_str = vt.iloc[0]["variant"]
-                # строка вида: "('A', 'B', 'C')"
-                seq = [s.strip().strip("'\"") for s in str(seq_str).strip("() ").split(",") if s.strip()]
-                seq = [s for s in seq if s not in ["", "'"]]
-                # восстановим пары
-                clean = []
-                # аккуратно собрать с учётом запятых в названиях не требуется, т.к. в примере их нет
-                for token in seq:
-                    if token.startswith("'") and token.endswith("'"):
-                        clean.append(token[1:-1])
-                    else:
-                        clean.append(token)
-                for i in range(1, len(clean)):
-                    golden_edges.add((clean[i-1], clean[i]))
+                seq = [s.strip() for s in str(seq_str).split("→") if s.strip()]
+                for i in range(1, len(seq)):
+                    golden_edges.add((seq[i-1], seq[i]))
         except Exception:
             pass
 
@@ -278,17 +629,13 @@ def build_and_save_dfg(
     dot.attr(rankdir=rankdir)
     dot.attr("node", shape="box", style="rounded,filled", fillcolor="#f8f9fb", color="#b5bdd6", fontname="Arial", fontsize="10")
 
-    # Рисуем рёбра со стилями
-    # Подготовка масштаба толщины по частоте
+    # Масштаб по частоте и легенда
     max_freq = max(freq_dfg.values()) if freq_dfg else 1
     def edge_width(f: int) -> str:
-        # от 0.5 до 4.0
         if max_freq <= 1:
             return "1.0"
         w = 0.5 + 3.5 * (f / max_freq)
         return f"{w:.2f}"
-
-    # Легенда
     with dot.subgraph(name="cluster_legend") as lg:
         lg.attr(label="Легенда", color="#b5bdd6", fontname="Arial", fontsize="10")
         lg.node("leg1", label="label = частота | ср.время (avg)", shape="note", fillcolor="#eef2ff")
@@ -298,55 +645,85 @@ def build_and_save_dfg(
         lg.node("leg5", label="фиолетовый = самопетля", shape="note", fillcolor="#f5e6ff")
         lg.node("leg6", label="синий пунктир = вне основной траектории", shape="note", fillcolor="#e7f0ff")
 
-    # Узлы
     for act in activities:
         dot.node(str(act), label=str(act))
 
-    # Рёбра
     for (a, b), f in sorted(freq_dfg.items(), key=lambda kv: (-kv[1], kv[0])):
         if f < min_freq:
             continue
         mean_sec = perf_mean_dfg.get((a, b))
         mean_h = _humanize_seconds(mean_sec)
         label = f"{f} | {mean_h}"
-
-        # стиль
         color = "#7c88a6"
         penwidth = edge_width(f)
         style = "solid"
-
-        # редкие рёбра
         if f <= rare_edge_threshold:
-            color = "#9ca3af"
-            style = "dashed"
-
-        # самопетли
+            color = "#9ca3af"; style = "dashed"
         if a == b:
-            color = "#7c3aed"  # фиолетовый
-
-        # высокий p90
+            color = "#7c3aed"
         p90 = edge_stats.get((a, b), {}).get("p90")
         if bottleneck_p90_threshold_s is not None and p90 is not None and p90 >= bottleneck_p90_threshold_s:
-            color = "#f59e0b"  # оранжевый
-
-        # SLA превышение
+            color = "#f59e0b"
         sla = sla_map.get((a, b))
         if sla is not None and p90 is not None and p90 > sla:
-            color = "#ef4444"  # красный
-
-        # вне основной траектории
+            color = "#ef4444"
         if golden_edges and (a, b) not in golden_edges:
             if style == "solid":
                 style = "dashed"
             color = "#2563eb"
-
         dot.edge(str(a), str(b), label=label, color=color, penwidth=penwidth, style=style)
 
-    # Сохранение
+    # Сохранение графа (PNG + опционально SVG/HTML)
     out_dir = os.path.dirname(output_png)
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
-    dot.render(filename=os.path.splitext(output_png)[0], cleanup=True)
+    base_no_ext = os.path.splitext(output_png)[0]
+    dot.render(filename=base_no_ext, cleanup=True)
+    if export_svg:
+        dot.format = "svg"
+        dot.render(filename=base_no_ext, cleanup=True)
+        dot.format = "png"
+    if export_html:
+        svg_path = f"{base_no_ext}.svg"
+        if os.path.isfile(svg_path):
+            html_path = f"{base_no_ext}.html"
+            with open(svg_path, "r", encoding="utf-8") as f:
+                svg = f.read()
+            html = f"""<!doctype html><html><head><meta charset='utf-8'><title>DFG</title>
+<style>body{{font-family:Arial,sans-serif;background:#0b1020;color:#e8ecf6;margin:0;padding:16px}} .wrap{{background:#fff;border-radius:8px;padding:12px}} .legend{{margin-bottom:12px}}</style>
+</head><body><div class='wrap'>{svg}</div></body></html>"""
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+
+    # Доп. отчёты
+    if export_reports:
+        os.makedirs(tables_dir, exist_ok=True)
+        trans_rows, case_durations = _compute_transitions_and_cases(formatted_df)
+        trans_df = pd.DataFrame(trans_rows)
+        # SLA breaches per case
+        if sla_map:
+            _export_sla_breaches(trans_df, sla_map, os.path.join(tables_dir, "sla_breaches_cases.csv"))
+        # Handoff & ping-pong
+        _export_handoff_and_pingpong(trans_df, os.path.join(tables_dir, "handoff_matrix.csv"), os.path.join(tables_dir, "ping_pong_pairs.csv"))
+        # Stage KPI
+        _export_stage_kpi(trans_df, os.path.join(tables_dir, "stage_kpi.csv"))
+        # Variant explorer
+        _export_variant_explorer(formatted_df, os.path.join(tables_dir, "variant_explorer.csv"))
+        # Anomalies
+        _export_anomalies(formatted_df, trans_df, os.path.join(tables_dir, "anomalies_cases.csv"))
+        # Returns and starts
+        _export_returns_and_starts(formatted_df, os.path.join(tables_dir, "returns.csv"), os.path.join(tables_dir, "return_to_start.csv"))
+        # Activity ping-pong
+        _export_activity_ping_pong(formatted_df, os.path.join(tables_dir, "activity_ping_pong.csv"))
+        # Rare activities
+        _export_rare_activities(formatted_df, os.path.join(tables_dir, "rare_activities.csv"), rare_activity_threshold)
+        # Manual steps
+        _export_manual_steps(formatted_df, os.path.join(tables_dir, "manual_steps.csv"))
+        # Unsuccessful outcomes
+        _export_unsuccess_outcomes(formatted_df, os.path.join(tables_dir, "unsuccess_outcomes.csv"))
+        # Cohort trends and trend test
+        _export_cohort_trends(formatted_df, os.path.join(tables_dir, "cohort_trends.csv"))
+        _export_duration_trend_test(formatted_df, os.path.join(tables_dir, "duration_trend_test.txt"))
 
 
 # -------------------------------
@@ -371,6 +748,11 @@ def parse_args(argv=None):
     parser.add_argument("--top-variant-csv", default="tables/variants_top.csv", help="CSV с колонками variant,count для эталонного пути")
     parser.add_argument("--rare-edge-threshold", type=int, default=5, help="Порог частоты для редких рёбер")
     parser.add_argument("--bottleneck-p90-threshold-s", type=float, default=43200.0, help="Порог p90 (сек) для подсветки bottleneck")
+    parser.add_argument("--no-reports", action="store_true", help="Не генерировать дополнительные отчёты")
+    parser.add_argument("--no-svg", action="store_true", help="Не сохранять SVG")
+    parser.add_argument("--no-html", action="store_true", help="Не сохранять HTML")
+    parser.add_argument("--tables-dir", default="tables", help="Папка для CSV отчётов")
+    parser.add_argument("--rare-activity-threshold", type=float, default=0.02, help="Порог доли кейсов для редких активностей")
     return parser.parse_args(argv)
 
 
@@ -391,6 +773,11 @@ def main(argv=None):
         top_variant_csv=args.top_variant_csv,
         rare_edge_threshold=args.rare_edge_threshold,
         bottleneck_p90_threshold_s=args.bottleneck_p90_threshold_s,
+        export_reports=not args.no_reports,
+        export_svg=not args.no_svg,
+        export_html=not args.no_html,
+        tables_dir=args.tables_dir,
+        rare_activity_threshold=args.rare_activity_threshold,
     )
     print(f"Готово. PNG: {os.path.abspath(args.output)}")
 
