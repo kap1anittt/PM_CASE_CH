@@ -6,472 +6,393 @@ import math
 import os
 import sys
 from typing import Dict, Tuple, Optional
-from collections import Counter
+from collections import Counter, defaultdict
 import glob
 import difflib
+from statistics import median
 
 import pandas as pd
 import pm4py
 from pm4py.algo.discovery.dfg import algorithm as dfg_algo
-from pm4py.statistics.traces.generic.log import case_statistics as case_stats
 from graphviz import Digraph
 
+# -------------------------------
+# Вспомогательные функции
+# -------------------------------
 
-import os
-import glob
-import sys
-import shutil
-
-# 📂 Рабочая директория
-WORK_DIR = "/Users/anna/Documents/Кейс чемпионат сбер/PM_CASE_CH/"
-TABLES_DIR = os.path.join(WORK_DIR, "tables")
-
-# ❌ Не трогаем эти файлы
-KEEP = {
-    "case_championship_last.csv",
-    os.path.basename(sys.argv[0]),  # сам .py
-    "README.md",
-    ".gitignore",
-}
-
-def clean_directory():
-    for path in glob.glob(os.path.join(WORK_DIR, "*")):
-        fname = os.path.basename(path)
-        if fname not in KEEP:
-            try:
-                if os.path.isfile(path):
-                    os.remove(path)
-                    print(f"Удалён файл: {fname}")
-                elif os.path.isdir(path):
-                    shutil.rmtree(path)
-                    print(f"Удалена папка: {fname}")
-            except Exception as e:
-                print(f"⚠️ Ошибка при удалении {fname}: {e}")
-
-# 1️⃣ Сначала чистим
-clean_directory()
-
-# 2️⃣ Создаём папку для таблиц заново
-os.makedirs(TABLES_DIR, exist_ok=True)
-
-# 3️⃣ Меняем текущую директорию процесса
-os.chdir(WORK_DIR)
+def _humanize_seconds(seconds: Optional[float]) -> str:
+    if seconds is None or not math.isfinite(seconds):
+        return "n/a"
+    seconds = float(seconds)
+    if seconds < 1:
+        # показать миллисекунды при очень малых значениях
+        return f"{seconds * 1000:.0f} ms"
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and len(parts) < 3:
+        parts.append(f"{minutes}m")
+    if sec and len(parts) < 3:
+        parts.append(f"{sec}s")
+    return " ".join(parts) if parts else f"{int(seconds)}s"
 
 
-# Создаем папку для таблиц, если её нет
-TABLES_DIR = "tables"
-if not os.path.exists(TABLES_DIR):
-    os.makedirs(TABLES_DIR)
-
-
-def resolve_csv_path(path: str) -> str:
-    """
-    Пытаемся корректно найти CSV по указанному пути:
-    - если существует как указан (абсолютный/относительный) — берём его;
-    - если нет — ищем в директории скрипта;
-    - затем — ищем по похожим именам (case-insensitive) в cwd и в папке скрипта (рекурсивно);
-    - если найдено несколько — берём первый попавшийся;
-    - если ничего не найдено — выбрасываем информативную ошибку со списком найденных CSV.
-    """
-    # 1) прямой путь
-    if os.path.isabs(path) and os.path.exists(path):
-        return os.path.abspath(path)
-    if os.path.exists(path):
-        return os.path.abspath(path)
-
-    # 2) путь относительно директории скрипта
-    script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
-    candidate = os.path.join(script_dir, path)
-    if os.path.exists(candidate):
-        return os.path.abspath(candidate)
-
-    # 3) expanduser
-    candidate = os.path.expanduser(path)
-    if os.path.exists(candidate):
-        return os.path.abspath(candidate)
-
-    # 4) поиск в cwd и script_dir по похожему имени (case-insensitive)
-    name = os.path.basename(path).lower()
-    for d in (os.getcwd(), script_dir):
-        try:
-            for f in os.listdir(d):
-                if f.lower() == name or name in f.lower():
-                    p = os.path.join(d, f)
-                    if os.path.isfile(p):
-                        return os.path.abspath(p)
-        except Exception:
-            pass
-
-    # 5) рекурсивный поиск в папке скрипта (ограничение глубины можно добавить при необходимости)
-    for root, _, files in os.walk(script_dir):
-        for f in files:
-            if f.lower() == name or name in f.lower():
-                return os.path.abspath(os.path.join(root, f))
-
-    # 6) если ничего не найдено — собрать список доступных CSV для диагностики и бросить ошибку
-    found = []
-    for d in (os.getcwd(), script_dir):
-        try:
-            for f in os.listdir(d):
-                if f.lower().endswith(".csv"):
-                    found.append(os.path.abspath(os.path.join(d, f)))
-        except Exception:
-            pass
-
-    raise FileNotFoundError(
-        f"CSV not found: {path}\n"
-        f"Searched locations:\n  cwd = {os.getcwd()}\n  script_dir = {script_dir}\n"
-        f"Found CSV files (in those dirs): {found}\n"
-        f"Run the script with --csv /full/path/to/file.csv if needed."
-    )
-
-
-# ---------- Чтение и подготовка лога ----------
-def build_event_log(
-    csv_path: str,
-    encoding: str = "utf-8-sig",
-    tz_local: Optional[str] = None,
-    id_col: str = "ID",
-    act_col: str = "Событие",
-    ts_col: str = "Время",
-) -> pm4py.objects.log.obj.EventLog:
-    # csv_path уже должен быть проверен/разрешён через resolve_csv_path
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV not found (after resolution): {csv_path}")
-    df = pd.read_csv(csv_path, encoding=encoding)
-    need = {id_col, act_col, ts_col}
-    miss = need - set(df.columns)
-    if miss:
-        raise KeyError(f"Нет столбцов: {miss}. Нашёл: {list(df.columns)}")
-    df = df.rename(columns={id_col: "case:concept:name", act_col: "concept:name", ts_col: "time:timestamp"})
-    ts = pd.to_datetime(df["time:timestamp"], errors="coerce")  # без utc=True!
-    # tz-логика
-    if tz_local:
-        if ts.dt.tz is None:
-            ts = ts.dt.tz_localize(tz_local, nonexistent="shift_forward", ambiguous="NaT").dt.tz_convert("UTC")
-        else:
-            ts = ts.dt.tz_convert("UTC")
+def _format_dataframe(
+    df: pd.DataFrame,
+    case_col: str,
+    activity_col: str,
+    ts_col: str,
+    ts_format: Optional[str]
+) -> pd.DataFrame:
+    # Парсинг времени
+    if ts_format:
+        df[ts_col] = pd.to_datetime(df[ts_col], format=ts_format, errors="coerce")
     else:
-        if ts.dt.tz is None:
-            ts = ts.dt.tz_localize("UTC")
-        else:
-            ts = ts.dt.tz_convert("UTC")
-    df["time:timestamp"] = ts  # <-- ВАЖНО: присвоить обратно!
-    # чистка и стабильная сортировка
-    df = df.dropna(subset=["case:concept:name", "concept:name", "time:timestamp"]).copy()
-    df["_row_ix"] = range(len(df))
-    df = df.sort_values(["case:concept:name", "time:timestamp", "_row_ix"]).reset_index(drop=True).drop(columns=["_row_ix"])
-    ev_df = pm4py.format_dataframe(df, case_id="case:concept:name", activity_key="concept:name", timestamp_key="time:timestamp")
-    return pm4py.convert_to_event_log(ev_df)
+        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
 
+    # Отфильтровать события без времени или активности
+    df = df.dropna(subset=[case_col, activity_col, ts_col]).copy()
 
-# ---------- Подсчёты ----------
-def edge_durations_seconds(log):
-    out = []
-    for trace in log:
-        for i in range(len(trace) - 1):
-            a = trace[i]["concept:name"]; b = trace[i + 1]["concept:name"]
-            t0 = trace[i]["time:timestamp"]; t1 = trace[i + 1]["time:timestamp"]
-            if pd.notna(t0) and pd.notna(t1):
-                sec = (pd.Timestamp(t1) - pd.Timestamp(t0)).total_seconds()
-                if sec >= 0:
-                    out.append((a, b, sec))
-    return out
-
-
-def path_signature(trace):
-    return "→".join([e["concept:name"] for e in trace])
-
-
-def _scale_penwidth(value: float, vmin: float, vmax: float, min_w=0.7, max_w=6.0) -> float:
-    if vmax <= vmin:
-        return (min_w + max_w) / 2.0
-    x = (value - vmin) / (vmax - vmin)
-    x = math.sqrt(max(0.0, min(1.0, x)))
-    return min_w + x * (max_w - min_w)
-
-
-def _sanitize_id(name: str) -> str:
-    if name is None:
-        name = "unnamed"
-    return str(name).replace("\n", " ").replace('"', "'")
-
-
-# ---------- Визуализации ----------
-# ---------- Комбинированная визуализация ----------
-def render_dfg_combined(
-    dfg_freq: Dict[Tuple[str, str], int],
-    dfg_perf: Dict[Tuple[str, str], float],
-    out_basename="dfg_combined",
-    min_ratio=0.01,
-    max_edges=None,
-    unit="h"
-):
-    if not dfg_freq or not dfg_perf:
-        print("DFG пуст."); return
-
-    total = sum(dfg_freq.values())
-    items = [((a, b), c) for (a, b), c in dfg_freq.items() if c / total >= min_ratio]
-    items.sort(key=lambda kv: kv[1], reverse=True)
-    if max_edges:
-        items = items[:max_edges]
-
-    nodes = set()
-    for (a, b), _ in items:
-        nodes.update([a, b])
-
-    counts = [c for _, c in items]
-    cmin, cmax = min(counts), max(counts)
-
-    def conv(sec):
-        if sec is None:
-            return None
-        if unit == "s":
-            return sec
-        if unit == "m":
-            return sec / 60.0
-        if unit == "h":
-            return sec / 3600.0
-        if unit == "d":
-            return sec / 86400.0
-        return sec
-
-    # собираем перформансы в выбранных единицах
-    perfs_raw = [dfg_perf.get((a, b), None) for (a, b), _ in items]
-    perfs = [conv(v) for v in perfs_raw if v is not None]
-    if perfs:
-        pmin, pmax = min(perfs), max(perfs)
-    else:
-        pmin, pmax = 0.0, 0.0
-
-    #  функция выбора цвета ребра по SLA-логике (три зоны)
-    def edge_color(sec_conv, pmin, pmax):
-        if sec_conv is None:
-            return "black"
-        # если диапазон нулевой — всё в средней/зелёной зоне (не будем делить на ноль)
-        if pmax <= pmin:
-            return "green"
-        thr1 = pmin + (pmax - pmin) * 0.33
-        thr2 = pmin + (pmax - pmin) * 0.66
-        if sec_conv <= thr1:
-            return "green"
-        elif sec_conv <= thr2:
-            return "yellow"
-        else:
-            return "red"
-
-    g = Digraph(engine="dot")
-    g.attr('graph',
-           rankdir='TB',
-           size="10,10!",
-           ratio="fill",
-           splines='spline',
-           fontname='DejaVu Sans')
-    g.attr("node", shape="box", style="rounded,filled", fontsize="11", fontname='DejaVu Sans')
-    g.attr("edge", fontsize="9", fontname='DejaVu Sans')
-
-    # частота узлов
-    node_freq = Counter()
-    for (a, b), c in items:
-        node_freq[a] += c
-        node_freq[b] += c
-    nfmin, nfmax = min(node_freq.values()), max(node_freq.values())
-
-    # Узлы серые
-    for n in sorted(nodes):
-        nid = _sanitize_id(n)
-        g.node(nid, label=nid, fillcolor="lightgray")
-
-    # Рёбра с трёхцветной логикой
-    for (a, b), c in items:
-        aw = _sanitize_id(a)
-        bw = _sanitize_id(b)
-        sec_raw = dfg_perf.get((a, b))
-        sec_conv = conv(sec_raw)
-        label = f"{c}×" + (f" | {sec_conv:.2f} {unit}" if sec_conv is not None else "")
-        color = edge_color(sec_conv, pmin, pmax)
-
-        g.edge(
-            aw, bw,
-            label=label,
-            penwidth=str(round(_scale_penwidth(c, cmin, cmax), 2)),
-            color=color,
-            fontcolor="gray20"
-        )
-
-    g.render(out_basename, format="png", cleanup=True)
-    print(f"Сохранено: {out_basename}.png (зелёный/жёлтый/красный)")
-
-
-# ---------- SLA (опционально) ----------
-def parse_sla(s: Optional[str]):
-    if not s:
-        return {}
-    rules = {}
-    for part in s.split(";"):
-        part = part.strip()
-        if not part:
-            continue
-        left, right = part.split("=")
-        src, dst = left.split("->")
-        rules[(src.strip(), dst.strip())] = float(right)
-    return rules
-
-
-def sla_breaches(df_edges, rules: Dict[Tuple[str, str], float]):
-    rows = []
-    for (src, dst), limit in rules.items():
-        dfp = df_edges[(df_edges["src"] == src) & (df_edges["dst"] == dst)]
-        if len(dfp) == 0:
-            rows.append({"src": src, "dst": dst, "count": 0, "breaches": 0, "breach_rate": None, "p90_s": None})
-            continue
-        count = len(dfp)
-        breaches = int((dfp["sec"] > limit).sum())
-        breach_rate = breaches / count if count else None
-        p90 = float(dfp["sec"].quantile(0.9)) if count else None
-        rows.append({"src": src, "dst": dst, "count": count, "breaches": breaches, "breach_rate": breach_rate, "p90_s": p90})
-    return pd.DataFrame(rows)
-
-
-# ---------- Основной ход ----------
-def main():
-    ap = argparse.ArgumentParser(description="Генератор отчётов по процессу")
-    ap.add_argument("--csv", default="case_championship_last.csv", help="Путь к CSV")
-    ap.add_argument("--encoding", default="utf-8-sig")
-    ap.add_argument("--tz", default=None, help="Напр., Europe/Moscow")
-    ap.add_argument("--min_ratio", type=float, default=0.02, help="Фильтр рёбер по доле переходов")
-    ap.add_argument("--max_edges", type=int, default=None, help="Топ-ребёр для отрисовки")
-    ap.add_argument("--perf_unit", default="h", choices=["s", "m", "h", "d"])
-    ap.add_argument("--sla", default=None, help='Формат: "A->B=86400;X->Y=7200" (секунды)')
-    args = ap.parse_args()
-
+    # Нормализация в формат pm4py
     try:
-        csv_path = resolve_csv_path(args.csv)
-        print(f"Использую CSV: {csv_path}")
-        log = build_event_log(csv_path, encoding=args.encoding, tz_local=args.tz)
-    except Exception as e:
-        print(f"Ошибка лога: {e}", file=sys.stderr)
-        sys.exit(1)
+        formatted_df = pm4py.format_dataframe(
+            df,
+            case_id=case_col,
+            activity_key=activity_col,
+            timestamp_key=ts_col
+        )
+    except Exception:
+        # Если в текущей версии pm4py отсутствует format_dataframe
+        formatted_df = df.rename(columns={
+            case_col: "case:concept:name",
+            activity_col: "concept:name",
+            ts_col: "time:timestamp",
+        }).copy()
+    return formatted_df
 
-    # Картинки DFG
-    dfg_freq = dfg_algo.apply(log, variant=dfg_algo.Variants.FREQUENCY)
-    dfg_perf = dfg_algo.apply(log, variant=dfg_algo.Variants.PERFORMANCE)
 
-    render_dfg_combined(
-        dfg_freq,
-        dfg_perf,
-        out_basename="dfg_combined",
-        min_ratio=args.min_ratio,
-        max_edges=args.max_edges,
-        unit=args.perf_unit)
+def _to_event_log(formatted_df: pd.DataFrame):
+    # Конвертация в EventLog (некоторые функции dfg работают и с DF, но лог надёжнее)
+    try:
+        from pm4py.objects.conversion.log import converter as log_converter
+        log = log_converter.apply(formatted_df)
+        return log
+    except Exception:
+        try:
+            # High-level API в некоторых версиях
+            return pm4py.convert_to_event_log(formatted_df)
+        except Exception:
+            # Как фолбэк — вернём сам DataFrame (dfg.apply умеет работать с DF)
+            return formatted_df
 
-    # Таблица по рёбрам (времена)
-    rows = edge_durations_seconds(log)
-    df_edges = pd.DataFrame(rows, columns=["src", "dst", "sec"])
-    agg = df_edges.groupby(["src", "dst"])["sec"].agg(
-        count="count",
-        avg_s="mean",
-        p50_s=lambda s: float(pd.Series(s).quantile(0.5)),
-        p90_s=lambda s: float(pd.Series(s).quantile(0.9)),
-        max_s="max"
-    ).reset_index().sort_values("p90_s", ascending=False)
-    agg.to_csv(os.path.join(TABLES_DIR, "bottlenecks_edges.csv"), index=False, encoding="utf-8-sig")
-    print(f"Сохранено: {os.path.join(TABLES_DIR, 'bottlenecks_edges.csv')}")
 
-    total_transitions = agg["count"].sum()
-    agg["ratio"] = agg["count"] / (total_transitions if total_transitions else 1)
-    rare_costly = agg[(agg["ratio"] < 0.02) & (agg["p90_s"] > 3600)]
-    rare_costly.to_csv(os.path.join(TABLES_DIR, "rare_costly_edges.csv"), index=False, encoding="utf-8-sig")
-    print(f"Сохранено: {os.path.join(TABLES_DIR, 'rare_costly_edges.csv')}")
+def _discover_frequency_dfg(log_like) -> Dict[Tuple[str, str], int]:
+    try:
+        dfg = dfg_algo.apply(log_like, variant=dfg_algo.Variants.FREQUENCY)
+        # dfg — dict с ключами (act_from, act_to) -> count
+        return dict(dfg)
+    except Exception:
+        # Фолбэк: вручную по DataFrame
+        if isinstance(log_like, pd.DataFrame):
+            df = log_like
+        else:
+            # Если это не DF, возвращаем пусто
+            return {}
+        df = df.sort_values(["case:concept:name", "time:timestamp"])  # type: ignore
+        counts: Dict[Tuple[str, str], int] = Counter()
+        for _, g in df.groupby("case:concept:name"):  # type: ignore
+            acts = g["concept:name"].tolist()  # type: ignore
+            for i in range(1, len(acts)):
+                counts[(acts[i-1], acts[i])] += 1
+        return dict(counts)
 
-    # Длительность кейсов
-    durations = case_stats.get_all_case_durations(log)  # сек
-    df_cases = pd.DataFrame({"case_duration_s": durations})
-    df_cases["case_duration_h"] = df_cases["case_duration_s"] / 3600.0
-    df_cases.to_csv(os.path.join(TABLES_DIR, "cases_durations.csv"), index=False, encoding="utf-8-sig")
-    print(f"Сохранено: {os.path.join(TABLES_DIR, 'cases_durations.csv')}")
 
-    # Варианты
-    variants = case_stats.get_variant_statistics(log)
-    df_variants = pd.DataFrame(variants).sort_values("count", ascending=False)
-    df_variants.to_csv(os.path.join(TABLES_DIR, "variants_top.csv"), index=False, encoding="utf-8-sig")
-    print(f"Сохранено: {os.path.join(TABLES_DIR, 'variants_top.csv')}")
+def _discover_performance_mean_dfg(log_like) -> Dict[Tuple[str, str], float]:
+    # Сначала пытаемся через pm4py PERFORMANCE
+    try:
+        perf_dfg = dfg_algo.apply(log_like, variant=dfg_algo.Variants.PERFORMANCE)
+        # Значения могут быть: число, список, словарь с суммой/средним
+        def _mean_from_value(v) -> Optional[float]:
+            if v is None:
+                return None
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                return float(v)
+            if isinstance(v, (list, tuple)) and len(v) > 0:
+                vals = [float(x) for x in v if x is not None and math.isfinite(float(x))]
+                return sum(vals) / len(vals) if vals else None
+            if isinstance(v, dict):
+                if "mean" in v and v["mean"] is not None:
+                    return float(v["mean"]) if math.isfinite(float(v["mean"])) else None
+                if "sum" in v and "count" in v and v["count"]:
+                    try:
+                        mean_val = float(v["sum"]) / float(v["count"])  # type: ignore
+                        return mean_val if math.isfinite(mean_val) else None
+                    except Exception:
+                        return None
+            return None
 
-    # быстрые/медленные пути
-    q90 = df_cases["case_duration_s"].quantile(0.9) if len(df_cases) else 0
-    q50 = df_cases["case_duration_s"].quantile(0.5) if len(df_cases) else 0
-    slow_cases, fast_cases = set(), set()
-    for trace in log:
-        cid = trace.attributes.get("concept:name")
-        ts = [e["time:timestamp"] for e in trace]
-        dur = (max(ts) - min(ts)).total_seconds() if len(ts) >= 2 else 0
-        if dur >= q90:
-            slow_cases.add(cid)
-        elif dur <= q50:
-            fast_cases.add(cid)
-    slow_paths, fast_paths = Counter(), Counter()
-    for trace in log:
-        cid = trace.attributes.get("concept:name")
-        sig = path_signature(trace)
-        if cid in slow_cases:
-            slow_paths[sig] += 1
-        elif cid in fast_cases:
-            fast_paths[sig] += 1
-    pd.DataFrame(slow_paths.items(), columns=["variant", "count"]).sort_values("count", ascending=False) \
-        .to_csv(os.path.join(TABLES_DIR, "variants_slow_top.csv"), index=False, encoding="utf-8-sig")
-    pd.DataFrame(fast_paths.items(), columns=["variant", "count"]).sort_values("count", ascending=False) \
-        .to_csv(os.path.join(TABLES_DIR, "variants_fast_top.csv"), index=False, encoding="utf-8-sig")
-    print(f"Сохранено: {os.path.join(TABLES_DIR, 'variants_slow_top.csv')}, {os.path.join(TABLES_DIR, 'variants_fast_top.csv')}")
+        means: Dict[Tuple[str, str], float] = {}
+        for k, v in perf_dfg.items():
+            m = _mean_from_value(v)
+            if m is not None:
+                means[k] = m
+        if means:
+            return means
+        # Если не получилось вытащить средние — упадём в фолбэк
+    except Exception:
+        pass
 
-    # Rework / повторы
-    def count_adjacent_repeats(trace):
-        names = [e["concept:name"] for e in trace]
-        return sum(1 for i in range(1, len(names)) if names[i] == names[i - 1])
-
-    def count_return_loops(trace):
-        names = [e["concept:name"] for e in trace]
-        from collections import Counter as C
-        c = C(names)
-        return sum(1 for k, v in c.items() if v > 1)
-
-    stats = []
-    for trace in log:
-        cid = trace.attributes.get("concept:name")
-        stats.append({"case_id": cid, "adjacent_repeats": count_adjacent_repeats(trace), "loops": count_return_loops(trace)})
-    pd.DataFrame(stats).to_csv(os.path.join(TABLES_DIR, "rework_by_case.csv"), index=False, encoding="utf-8-sig")
-    print(f"Сохранено: {os.path.join(TABLES_DIR, 'rework_by_case.csv')}")
-    same_pairs = df_edges.groupby(["src", "dst"]).size().reset_index(name="count")
-    repeats_same = same_pairs[same_pairs["src"] == same_pairs["dst"]].sort_values("count", ascending=False)
-    repeats_same.to_csv(os.path.join(TABLES_DIR, "repeated_same_activity.csv"), index=False, encoding="utf-8-sig")
-    print(f"Сохранено: {os.path.join(TABLES_DIR, 'repeated_same_activity.csv')}")
-
-    # Тренд по месяцам
-    rows = []
-    for trace in log:
-        cid = trace.attributes.get("concept:name")
-        ts = [e["time:timestamp"] for e in trace]
-        if len(ts) >= 2:
-            start = min(ts)
-            dur_s = (max(ts) - min(ts)).total_seconds()
-            rows.append({"case_id": cid, "start_date": pd.Timestamp(start).date(), "dur_s": dur_s})
-    df_time = pd.DataFrame(rows)
-    if len(df_time):
-        df_time["month"] = pd.to_datetime(df_time["start_date"]).dt.to_period("M").dt.to_timestamp()
-        trend = df_time.groupby("month")["dur_s"].agg(["count", "median", "mean", "max"]).reset_index()
-        trend.to_csv(os.path.join(TABLES_DIR, "duration_trend_by_month.csv"), index=False, encoding="utf-8-sig")
-        print(f"Сохранено: {os.path.join(TABLES_DIR, 'duration_trend_by_month.csv')}")
-
-    # SLA (если передан)
-    rules = parse_sla(args.sla)
-    if rules:
-        df_sla = sla_breaches(df_edges, rules)
-        df_sla.to_csv(os.path.join(TABLES_DIR, "sla_breaches.csv"), index=False, encoding="utf-8-sig")
-        print(f"Сохранено: {os.path.join(TABLES_DIR, 'sla_breaches.csv')}")
+    # Фолбэк: считаем среднее время между соседними событиями в пределах одного кейса
+    if isinstance(log_like, pd.DataFrame):
+        df = log_like
     else:
-        agg[["src", "dst", "count", "p90_s"]].to_csv(os.path.join(TABLES_DIR, "edges_sla_template.csv"), index=False, encoding="utf-8-sig")
-        print(f"Сохранено: {os.path.join(TABLES_DIR, 'edges_sla_template.csv')} (добавь столбец sla_s и прогони скрипт с --sla)")
+        # конвертируем лог обратно в DF через "плоское" представление, если возможно
+        try:
+            from pm4py.objects.conversion.log import converter as log_converter
+            df = log_converter.apply(log_like, variant=log_converter.Variants.TO_DATA_FRAME)
+        except Exception:
+            return {}
 
-    print("\nГОТОВО. Смотри PNG в текущей директории и CSV в папке 'tables'.")
+    df = df.sort_values(["case:concept:name", "time:timestamp"])  # type: ignore
+    sums: Dict[Tuple[str, str], float] = defaultdict(float)
+    counts: Dict[Tuple[str, str], int] = defaultdict(int)
+
+    # Ожидаем типы: activity в "concept:name", время в "time:timestamp"
+    for _, g in df.groupby("case:concept:name"):  # type: ignore
+        acts = g["concept:name"].tolist()  # type: ignore
+        times = g["time:timestamp"].tolist()  # type: ignore
+        for i in range(1, len(acts)):
+            a, b = acts[i-1], acts[i]
+            dt = (times[i] - times[i-1]).total_seconds() if pd.notnull(times[i]) and pd.notnull(times[i-1]) else None
+            if dt is not None and dt >= 0:
+                sums[(a, b)] += dt
+                counts[(a, b)] += 1
+
+    means: Dict[Tuple[str, str], float] = {}
+    for k in sums:
+        if counts[k] > 0:
+            means[k] = sums[k] / counts[k]
+    return means
+
+
+def _compute_edge_percentiles(df: pd.DataFrame) -> Dict[Tuple[str, str], Dict[str, float]]:
+    df = df.sort_values(["case:concept:name", "time:timestamp"])  # type: ignore
+    per_edge: Dict[Tuple[str, str], list] = defaultdict(list)
+    for _, g in df.groupby("case:concept:name"):  # type: ignore
+        acts = g["concept:name"].tolist()  # type: ignore
+        times = g["time:timestamp"].tolist()  # type: ignore
+        for i in range(1, len(acts)):
+            a, b = acts[i-1], acts[i]
+            t1, t2 = times[i-1], times[i]
+            if pd.notnull(t1) and pd.notnull(t2):
+                dt = (t2 - t1).total_seconds()
+                if dt >= 0:
+                    per_edge[(a, b)].append(float(dt))
+    result: Dict[Tuple[str, str], Dict[str, float]] = {}
+    for k, arr in per_edge.items():
+        if not arr:
+            continue
+        arr_sorted = sorted(arr)
+        n = len(arr_sorted)
+        p50 = median(arr_sorted)
+        idx90 = max(0, int(math.ceil(0.9 * n)) - 1)
+        p90 = float(arr_sorted[idx90])
+        avg = sum(arr_sorted) / n
+        result[k] = {"avg": avg, "p50": p50, "p90": p90}
+    return result
+
+
+def build_and_save_dfg(
+    input_csv: str,
+    output_png: str,
+    case_col: str,
+    activity_col: str,
+    ts_col: str,
+    ts_format: Optional[str],
+    sep: str,
+    encoding: str,
+    min_freq: int,
+    rankdir: str,
+    sla_csv: Optional[str] = None,
+    top_variant_csv: Optional[str] = None,
+    rare_edge_threshold: int = 5,
+    bottleneck_p90_threshold_s: Optional[float] = None
+) -> None:
+    if not os.path.isfile(input_csv):
+        raise FileNotFoundError(f"Не найден входной CSV: {input_csv}")
+
+    df = pd.read_csv(input_csv, sep=sep, encoding=encoding)
+    formatted_df = _format_dataframe(df, case_col, activity_col, ts_col, ts_format)
+    log_like = _to_event_log(formatted_df)
+
+    freq_dfg = _discover_frequency_dfg(log_like)
+    perf_mean_dfg = _discover_performance_mean_dfg(log_like)
+    edge_stats = _compute_edge_percentiles(formatted_df)
+
+    # SLA карта
+    sla_map: Dict[Tuple[str, str], float] = {}
+    if sla_csv and os.path.isfile(sla_csv):
+        try:
+            sla_df = pd.read_csv(sla_csv)
+            for _, r in sla_df.iterrows():
+                src = str(r["src"]) if "src" in sla_df.columns else str(r[0])
+                dst = str(r["dst"]) if "dst" in sla_df.columns else str(r[1])
+                p90_s = float(r["p90_s"]) if "p90_s" in sla_df.columns else float(r[3])
+                sla_map[(src, dst)] = p90_s
+        except Exception:
+            pass
+
+    # Эталонные рёбра из топ-варианта: распарсим первую строку с наибольшим count
+    golden_edges: set = set()
+    if top_variant_csv and os.path.isfile(top_variant_csv):
+        try:
+            vt = pd.read_csv(top_variant_csv)
+            vt = vt.sort_values("count", ascending=False)
+            if len(vt) > 0:
+                seq_str = vt.iloc[0]["variant"]
+                # строка вида: "('A', 'B', 'C')"
+                seq = [s.strip().strip("'\"") for s in str(seq_str).strip("() ").split(",") if s.strip()]
+                seq = [s for s in seq if s not in ["", "'"]]
+                # восстановим пары
+                clean = []
+                # аккуратно собрать с учётом запятых в названиях не требуется, т.к. в примере их нет
+                for token in seq:
+                    if token.startswith("'") and token.endswith("'"):
+                        clean.append(token[1:-1])
+                    else:
+                        clean.append(token)
+                for i in range(1, len(clean)):
+                    golden_edges.add((clean[i-1], clean[i]))
+        except Exception:
+            pass
+
+    # Узлы
+    activities = sorted(set(formatted_df["concept:name"].unique()))  # type: ignore
+
+    dot = Digraph("DFG", format="png")
+    dot.attr(rankdir=rankdir)
+    dot.attr("node", shape="box", style="rounded,filled", fillcolor="#f8f9fb", color="#b5bdd6", fontname="Arial", fontsize="10")
+
+    # Рисуем рёбра со стилями
+    # Подготовка масштаба толщины по частоте
+    max_freq = max(freq_dfg.values()) if freq_dfg else 1
+    def edge_width(f: int) -> str:
+        # от 0.5 до 4.0
+        if max_freq <= 1:
+            return "1.0"
+        w = 0.5 + 3.5 * (f / max_freq)
+        return f"{w:.2f}"
+
+    # Легенда
+    with dot.subgraph(name="cluster_legend") as lg:
+        lg.attr(label="Легенда", color="#b5bdd6", fontname="Arial", fontsize="10")
+        lg.node("leg1", label="label = частота | ср.время (avg)", shape="note", fillcolor="#eef2ff")
+        lg.node("leg2", label="красный = SLA p90 превышен", shape="note", fillcolor="#ffe7e7")
+        lg.node("leg3", label="оранжевый = высокий p90", shape="note", fillcolor="#fff4e5")
+        lg.node("leg4", label="серый пунктир = редкие рёбра", shape="note", fillcolor="#f3f4f6")
+        lg.node("leg5", label="фиолетовый = самопетля", shape="note", fillcolor="#f5e6ff")
+        lg.node("leg6", label="синий пунктир = вне основной траектории", shape="note", fillcolor="#e7f0ff")
+
+    # Узлы
+    for act in activities:
+        dot.node(str(act), label=str(act))
+
+    # Рёбра
+    for (a, b), f in sorted(freq_dfg.items(), key=lambda kv: (-kv[1], kv[0])):
+        if f < min_freq:
+            continue
+        mean_sec = perf_mean_dfg.get((a, b))
+        mean_h = _humanize_seconds(mean_sec)
+        label = f"{f} | {mean_h}"
+
+        # стиль
+        color = "#7c88a6"
+        penwidth = edge_width(f)
+        style = "solid"
+
+        # редкие рёбра
+        if f <= rare_edge_threshold:
+            color = "#9ca3af"
+            style = "dashed"
+
+        # самопетли
+        if a == b:
+            color = "#7c3aed"  # фиолетовый
+
+        # высокий p90
+        p90 = edge_stats.get((a, b), {}).get("p90")
+        if bottleneck_p90_threshold_s is not None and p90 is not None and p90 >= bottleneck_p90_threshold_s:
+            color = "#f59e0b"  # оранжевый
+
+        # SLA превышение
+        sla = sla_map.get((a, b))
+        if sla is not None and p90 is not None and p90 > sla:
+            color = "#ef4444"  # красный
+
+        # вне основной траектории
+        if golden_edges and (a, b) not in golden_edges:
+            if style == "solid":
+                style = "dashed"
+            color = "#2563eb"
+
+        dot.edge(str(a), str(b), label=label, color=color, penwidth=penwidth, style=style)
+
+    # Сохранение
+    out_dir = os.path.dirname(output_png)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    dot.render(filename=os.path.splitext(output_png)[0], cleanup=True)
+
+
+# -------------------------------
+# CLI
+# -------------------------------
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Построение DFG графа с частотами и средним временем переходов (pm4py + Graphviz)"
+    )
+    parser.add_argument("-i", "--input", required=True, help="Путь к входному CSV")
+    parser.add_argument("-o", "--output", default="dfg_combined.png", help="Выходной PNG (будет перезаписан)")
+    parser.add_argument("--case-col", default="case_id", help="Колонка идентификатора кейса")
+    parser.add_argument("--activity-col", default="activity", help="Колонка названия активности")
+    parser.add_argument("--timestamp-col", default="timestamp", help="Колонка метки времени")
+    parser.add_argument("--timestamp-format", default=None, help="Формат времени для strptime, если не ISO (например, %%Y-%%m-%%d %%H:%%M:%%S)")
+    parser.add_argument("--sep", default=",", help="Разделитель CSV (по умолчанию ',')")
+    parser.add_argument("--encoding", default="utf-8", help="Кодировка CSV")
+    parser.add_argument("--min-freq", type=int, default=1, help="Минимальная частота ребра для отображения")
+    parser.add_argument("--rankdir", choices=["LR", "TB", "BT", "RL"], default="TB", help="Направление графа (LR/TB/BT/RL)")
+    parser.add_argument("--sla-csv", default="tables/edges_sla_template.csv", help="CSV с колонками src,dst,p90_s для SLA")
+    parser.add_argument("--top-variant-csv", default="tables/variants_top.csv", help="CSV с колонками variant,count для эталонного пути")
+    parser.add_argument("--rare-edge-threshold", type=int, default=5, help="Порог частоты для редких рёбер")
+    parser.add_argument("--bottleneck-p90-threshold-s", type=float, default=43200.0, help="Порог p90 (сек) для подсветки bottleneck")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    build_and_save_dfg(
+        input_csv=args.input,
+        output_png=args.output,
+        case_col=args.case_col,
+        activity_col=args.activity_col,
+        ts_col=args.timestamp_col,
+        ts_format=args.timestamp_format,
+        sep=args.sep,
+        encoding=args.encoding,
+        min_freq=args.min_freq,
+        rankdir=args.rankdir,
+        sla_csv=args.sla_csv,
+        top_variant_csv=args.top_variant_csv,
+        rare_edge_threshold=args.rare_edge_threshold,
+        bottleneck_p90_threshold_s=args.bottleneck_p90_threshold_s,
+    )
+    print(f"Готово. PNG: {os.path.abspath(args.output)}")
 
 
 if __name__ == "__main__":
